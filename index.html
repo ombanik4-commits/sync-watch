@@ -1,0 +1,473 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SyncWatch - Watch Together</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Load Firebase 11.6.1 -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { 
+            getAuth, 
+            signInAnonymously, 
+            onAuthStateChanged, 
+            signInWithCustomToken 
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { 
+            getFirestore, 
+            doc, 
+            getDoc, 
+            setDoc, 
+            addDoc, 
+            collection, 
+            onSnapshot, 
+            query, 
+            orderBy, 
+            serverTimestamp,
+            setLogLevel
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- Firebase Configuration ---
+        // These global variables (__app_id, __firebase_config, __initial_auth_token)
+        // are injected by the environment.
+        
+        let app, db, auth;
+        let localUserId = null;
+        let currentRoomId = null;
+        let isUpdatingFromFirestore = false;
+        let unsubRoom = () => {};
+        let unsubChat = () => {};
+
+        // --- DOM Elements ---
+        const roomSelectionView = document.getElementById('room-selection-view');
+        const appView = document.getElementById('app-view');
+        const roomIdInput = document.getElementById('roomIdInput');
+        const createRoomBtn = document.getElementById('createRoomBtn');
+        const joinRoomBtn = document.getElementById('joinRoomBtn');
+        const userIdDisplay = document.getElementById('userIdDisplay');
+        const currentRoomIdDisplay = document.getElementById('currentRoomIdDisplay');
+        const videoUrlInput = document.getElementById('videoUrlInput');
+        const loadVideoBtn = document.getElementById('loadVideoBtn');
+        const videoPlayer = document.getElementById('videoPlayer');
+        const chatMessages = document.getElementById('chatMessages');
+        const chatInput = document.getElementById('chatInput');
+        const sendChatBtn = document.getElementById('sendChatBtn');
+        const emoteContainer = document.getElementById('emoteContainer');
+        const appLoading = document.getElementById('app-loading');
+        const appError = document.getElementById('app-error');
+
+        // --- Utility Functions ---
+        
+        /** Generates a simple 6-char random ID */
+        function generateRoomId() {
+            return Math.random().toString(36).substring(2, 8).toUpperCase();
+        }
+        
+        /** Show an error message to the user */
+        function showError(message) {
+            appError.textContent = message;
+            appError.classList.remove('hidden');
+            setTimeout(() => {
+                 appError.classList.add('hidden');
+            }, 5000);
+        }
+
+        // --- Firebase Initialization & Auth ---
+        
+        /** Initialize Firebase and set up auth */
+        function initializeAndAuth() {
+            try {
+                // 1. Get Config and App ID
+                const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-syncwatch-app';
+                if (typeof __firebase_config === 'undefined' || !__firebase_config) {
+                    console.error("Firebase config is not available.");
+                    showError("Could not connect to services. Config not found.");
+                    appLoading.classList.add('hidden');
+                    return;
+                }
+                const firebaseConfig = JSON.parse(__firebase_config);
+
+                // 2. Initialize Firebase
+                app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                setLogLevel('Debug'); // Enable debug logs
+
+                // 3. Set up Auth State Listener
+                onAuthStateChanged(auth, async (user) => {
+                    if (user) {
+                        // User is signed in
+                        localUserId = user.uid;
+                        userIdDisplay.textContent = `Your User ID: ${localUserId}`;
+                        console.log("User authenticated:", localUserId);
+                        // User is ready, show room selection
+                        appLoading.classList.add('hidden');
+                        roomSelectionView.classList.remove('hidden');
+                    } else {
+                        // User is signed out, attempt to sign in
+                        console.log("No user found, attempting sign in...");
+                        await attemptSignIn();
+                    }
+                });
+
+            } catch (error) {
+                console.error("Error during Firebase initialization:", error);
+                showError(`Initialization Error: ${error.message}`);
+                appLoading.classList.add('hidden');
+            }
+        }
+        
+        /** Attempt to sign in with custom token or anonymously */
+        async function attemptSignIn() {
+            try {
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    console.log("Signing in with custom token...");
+                    await signInWithCustomToken(auth, __initial_auth_token);
+                } else {
+                    console.log("Signing in anonymously...");
+                    await signInAnonymously(auth);
+                }
+            } catch (error) {
+                console.error("Error signing in:", error);
+                showError(`Authentication Error: ${error.message}`);
+                appLoading.classList.add('hidden');
+            }
+        }
+
+        // --- Room Logic ---
+
+        /** Creates a new room and joins it */
+        function createRoom() {
+            const newRoomId = generateRoomId();
+            joinRoom(newRoomId);
+        }
+
+        /** Joins a specified room */
+        async function joinRoom(roomId) {
+            if (!roomId) {
+                showError("Please enter a valid Room ID.");
+                return;
+            }
+            console.log(`Attempting to join room: ${roomId}`);
+            
+            // 1. Unsubscribe from any previous listeners
+            unsubRoom();
+            unsubChat();
+
+            // 2. Set new room ID
+            currentRoomId = roomId.toUpperCase();
+            
+            // 3. Get App ID
+            const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-syncwatch-app';
+            
+            try {
+                // 4. Check if room exists, create if not
+                const roomDocRef = doc(db, 'artifacts', appId, 'public', 'data', 'sync_rooms', currentRoomId);
+                const roomDoc = await getDoc(roomDocRef);
+                
+                if (!roomDoc.exists()) {
+                    console.log(`Creating new room: ${currentRoomId}`);
+                    await setDoc(roomDocRef, {
+                        videoUrl: "",
+                        playbackState: "paused",
+                        currentTime: 0,
+                        lastEventBy: localUserId,
+                        lastEventTimestamp: serverTimestamp()
+                    });
+                }
+                
+                // 5. Set up new listeners
+                setupRoomListener(appId, currentRoomId);
+                setupChatListener(appId, currentRoomId);
+
+                // 6. Update UI
+                currentRoomIdDisplay.textContent = `Room ID: ${currentRoomId}`;
+                roomSelectionView.classList.add('hidden');
+                appView.classList.remove('hidden');
+                console.log(`Successfully joined room: ${currentRoomId}`);
+
+            } catch (error) {
+                console.error("Error joining room:", error);
+                showError(`Error joining room: ${error.message}`);
+            }
+        }
+        
+        // --- Firestore Listeners (Sync -> UI) ---
+
+        /** Listen for changes to the room's video state */
+        function setupRoomListener(appId, roomId) {
+            const roomDocRef = doc(db, 'artifacts', appId, 'public', 'data', 'sync_rooms', roomId);
+            unsubRoom = onSnapshot(roomDocRef, (doc) => {
+                if (!doc.exists()) {
+                    console.warn("Room document does not exist.");
+                    return;
+                }
+                
+                const data = doc.data();
+                if (data.lastEventBy === localUserId) {
+                    console.log("Ignoring own event.");
+                    return; // This change was made by us, ignore it.
+                }
+
+                console.log("Received update from Firestore:", data);
+                
+                // Set flag to prevent local events from firing back to Firestore
+                isUpdatingFromFirestore = true;
+
+                // 1. Sync Video URL
+                if (data.videoUrl && videoPlayer.src !== data.videoUrl) {
+                    console.log(`Syncing video URL: ${data.videoUrl}`);
+                    videoPlayer.src = data.videoUrl;
+                    videoUrlInput.value = data.videoUrl;
+                }
+
+                // 2. Sync Playback State
+                if (data.playbackState === "playing" && videoPlayer.paused) {
+                    console.log("Syncing: Play");
+                    videoPlayer.play().catch(e => console.warn("Play interrupted:", e.message));
+                } else if (data.playbackState === "paused" && !videoPlayer.paused) {
+                    console.log("Syncing: Pause");
+                    videoPlayer.pause();
+                }
+
+                // 3. Sync Current Time (with a 2-second buffer to prevent "jiggle")
+                const timeDifference = Math.abs(data.currentTime - videoPlayer.currentTime);
+                if (timeDifference > 2) {
+                    console.log(`Syncing time: ${data.currentTime}`);
+                    videoPlayer.currentTime = data.currentTime;
+                }
+
+                // Unset flag after a short delay to allow DOM to update
+                setTimeout(() => {
+                    isUpdatingFromFirestore = false;
+                }, 500); 
+
+            }, (error) => {
+                console.error("Error in room snapshot listener:", error);
+                showError("Lost connection to room state.");
+            });
+        }
+
+        /** Listen for new chat messages */
+        function setupChatListener(appId, roomId) {
+            const chatColRef = collection(db, 'artifacts', appId, 'public', 'data', 'sync_rooms', roomId, 'chat_messages');
+            const q = query(chatColRef, orderBy("timestamp", "asc"));
+            
+            unsubChat = onSnapshot(q, (snapshot) => {
+                console.log("Received chat update.");
+                chatMessages.innerHTML = ""; // Clear existing messages
+                snapshot.docs.forEach(doc => {
+                    renderChatMessage(doc.data());
+                });
+                // Auto-scroll to bottom
+                chatMessages.scrollTop = chatMessages.scrollHeight;
+            }, (error) => {
+                console.error("Error in chat snapshot listener:", error);
+                showError("Lost connection to chat.");
+            });
+        }
+
+        /** Helper to render a single chat message */
+        function renderChatMessage(data) {
+            const messageEl = document.createElement('div');
+            const senderId = data.userId.substring(0, 6);
+            
+            if (data.isEmote) {
+                messageEl.classList.add('text-4xl', 'text-center', 'py-2');
+                messageEl.textContent = data.text;
+            } else {
+                messageEl.classList.add('p-3', 'rounded-lg', 'bg-gray-700', 'break-words');
+                messageEl.innerHTML = `<strong class="text-cyan-400 block">User ${senderId}:</strong> ${data.text}`;
+            }
+            chatMessages.appendChild(messageEl);
+        }
+
+        // --- Event Handlers (UI -> Sync) ---
+
+        /** Send local video state update to Firestore */
+        function syncVideoState() {
+            if (isUpdatingFromFirestore || !currentRoomId) {
+                return; // Don't send updates if we're in the middle of receiving one
+            }
+
+            console.log("Sending local state to Firestore.");
+            const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-syncwatch-app';
+            const roomDocRef = doc(db, 'artifacts', appId, 'public', 'data', 'sync_rooms', currentRoomId);
+            
+            const state = {
+                playbackState: videoPlayer.paused ? "paused" : "playing",
+                currentTime: videoPlayer.currentTime,
+                lastEventBy: localUserId,
+                lastEventTimestamp: serverTimestamp()
+            };
+
+            setDoc(roomDocRef, state, { merge: true }).catch(error => {
+                console.error("Error syncing video state:", error);
+                showError("Failed to send controls update.");
+            });
+        }
+        
+        /** Handle loading a new video URL */
+        function handleLoadVideo() {
+            const url = videoUrlInput.value.trim();
+            if (!url || !currentRoomId) {
+                showError("Please enter a valid video URL.");
+                return;
+            }
+
+            console.log(`Loading new video: ${url}`);
+            const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-syncwatch-app';
+            const roomDocRef = doc(db, 'artifacts', appId, 'public', 'data', 'sync_rooms', currentRoomId);
+            
+            const state = {
+                videoUrl: url,
+                playbackState: "paused",
+                currentTime: 0,
+                lastEventBy: localUserId,
+                lastEventTimestamp: serverTimestamp()
+            };
+            
+            // Set the state in Firestore. The snapshot listener will handle updating the local player.
+            setDoc(roomDocRef, state, { merge: true }).catch(error => {
+                console.error("Error loading video URL:", error);
+                showError("Failed to load new video.");
+            });
+        }
+
+        /** Send a chat message to Firestore */
+        function handleSendChat() {
+            const text = chatInput.value.trim();
+            if (text === "" || !currentRoomId) {
+                return;
+            }
+
+            console.log("Sending chat message.");
+            const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-syncwatch-app';
+            const chatColRef = collection(db, 'artifacts', appId, 'public', 'data', 'sync_rooms', currentRoomId, 'chat_messages');
+            
+            addDoc(chatColRef, {
+                userId: localUserId,
+                text: text,
+                isEmote: false,
+                timestamp: serverTimestamp()
+            }).then(() => {
+                chatInput.value = ""; // Clear input on success
+            }).catch(error => {
+                console.error("Error sending message:", error);
+                showError("Failed to send message.");
+            });
+        }
+        
+        /** Send an emote to Firestore */
+        function handleSendEmote(emote) {
+            if (!currentRoomId) return;
+            
+            console.log("Sending emote.");
+            const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-syncwatch-app';
+            const chatColRef = collection(db, 'artifacts', appId, 'public', 'data', 'sync_rooms', currentRoomId, 'chat_messages');
+            
+            addDoc(chatColRef, {
+                userId: localUserId,
+                text: emote,
+                isEmote: true,
+                timestamp: serverTimestamp()
+            }).catch(error => {
+                console.error("Error sending emote:", error);
+                showError("Failed to send emote.");
+            });
+        }
+
+        // --- Attach Event Listeners ---
+        
+        // Room selection
+        createRoomBtn.addEventListener('click', createRoom);
+        joinRoomBtn.addEventListener('click', () => joinRoom(roomIdInput.value));
+
+        // Video controls
+        loadVideoBtn.addEventListener('click', handleLoadVideo);
+        videoPlayer.addEventListener('play', syncVideoState);
+        videoPlayer.addEventListener('pause', syncVideoState);
+        videoPlayer.addEventListener('seeked', syncVideoState); // Fired when user finishes scrubbing
+
+        // Chat controls
+        sendChatBtn.addEventListener('click', handleSendChat);
+        chatInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault(); // Prevent newline
+                handleSendChat();
+            }
+        });
+
+        // Emote buttons
+        emoteContainer.addEventListener('click', (e) => {
+            const button = e.target.closest('.emote-btn');
+            if (button) {
+                handleSendEmote(button.dataset.emote);
+            }
+        });
+
+        // --- Start Application ---
+        document.addEventListener('DOMContentLoaded', initializeAndAuth);
+
+    </script>
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+        }
+        /* Custom scrollbar for chat */
+        #chatMessages::-webkit-scrollbar {
+            width: 8px;
+        }
+        #chatMessages::-webkit-scrollbar-track {
+            background: #2d3748; /* bg-gray-800 */
+        }
+        #chatMessages::-webkit-scrollbar-thumb {
+            background: #4a5568; /* bg-gray-600 */
+            border-radius: 4px;
+        }
+        #chatMessages::-webkit-scrollbar-thumb:hover {
+            background: #718096; /* bg-gray-500 */
+        }
+        /* Style for video player controls */
+        video::-webkit-media-controls-panel {
+            background-color: rgba(26, 32, 44, 0.8); /* bg-gray-900 with opacity */
+        }
+    </style>
+</head>
+<body class="bg-gray-900 text-white min-h-screen flex items-center justify-center p-4">
+
+    <!-- Loading Indicator -->
+    <div id="app-loading" class="flex flex-col items-center">
+        <svg class="animate-spin -ml-1 mr-3 h-10 w-10 text-cyan-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+        </svg>
+        <span class="mt-2 text-lg">Connecting to SyncWatch...</span>
+    </div>
+    
+    <!-- Error Message Display -->
+    <div id="app-error" class="hidden absolute top-5 right-5 bg-red-600 text-white p-4 rounded-lg shadow-lg">
+        Error message will appear here.
+    </div>
+
+    <!-- Room Selection View -->
+    <div id="room-selection-view" class="hidden w-full max-w-md bg-gray-800 p-8 rounded-lg shadow-2xl">
+        <h1 class="text-3xl font-bold text-center mb-6 text-cyan-400">SyncWatch</h1>
+        <p class="text-center mb-4 text-gray-300">Watch videos with your partner, in sync.</p>
+        
+        <div class="mb-6">
+            <button id="createRoomBtn" class="w-full bg-cyan-600 hover:bg-cyan-500 text-white font-bold py-3 px-4 rounded-lg shadow-lg transition duration-200">
+                Create a New Room
+            </button>
+        </div>
+        
+        <div class="flex items-center mb-6">
+            <hr class="flex-grow border-gray-600">
+            <span class="px-4 text-gray-400">OR</span>
+            <hr class="flex-grow border-gray-600">
+        </div>
+
+        <div class="space-y-4">
+            <input type="text" id="roomIdInput" placeholder="Enter Room ID to Join" class="w-full p-3 bg-gray-700 border border-gray-600 rounded-lg t
